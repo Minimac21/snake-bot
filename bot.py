@@ -14,7 +14,9 @@ Requirements:
     playwright install-deps    # Linux only
 """
 
+
 import pytesseract
+import base64
 from PIL import Image
 import asyncio
 import math
@@ -23,25 +25,22 @@ import cv2
 import time
 from playwright.async_api import async_playwright
 from argparse import ArgumentParser
+from geometry import line_intersects_contour, detect_game_objects
+from objects import GameObject
 
 arg_parser = ArgumentParser()
 arg_parser.add_argument("--debug", "-d", action="store_true")
+arg_parser.add_argument("--time", "-t", action="store_true")
 args = arg_parser.parse_args()
 
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-OUTPUT="/home/mac/projects/snake/out"
+OUTPUT_DIR = "/home/mac/projects/snake/out"
 GAME_URL       = "https://snake.io"
-FRAME_RATE     = 0.05
-CHASE_RADIUS   = 450
-BOOST_MIN_DIST = 80
-BOOST_MAX_DIST = 380
 
-# ─── HSV Color Ranges ──────────────────────────────────────────────────────────
-ENEMY_LOWER     = np.array([0,   120, 120])
-ENEMY_UPPER     = np.array([179, 255, 255])
-BG_LOWER        = np.array([82,  50,  130])
-BG_UPPER        = np.array([99, 145, 225])
+
+# ─── Frame Info ──────────────────────────────────────────────────────────
+BOTTOM_CROP = 40
 
 # ─── JS: capture WebGL frame as JPEG base64 via a 2D proxy canvas ─────────────
 # Hooking rAF lets us read pixels right after the game draws (before buffer clear).
@@ -93,10 +92,38 @@ HOOK_JS = """
 READ_JS = "() => window.__botFrame"
 
 
+CURSOR_JS = """
+(() => {
+  if (window.top !== window) return;
+  // Grab the real rAF now, before the bot's HOOK_JS replaces it.
+  // Otherwise every cursor redraw would trigger an extra readPixels.
+  const raf = window.requestAnimationFrame.bind(window);
+  let dot = null, x = 0, y = 0, queued = false;
+
+  const draw = () => {
+    queued = false;
+    if (dot) dot.style.transform = `translate3d(${x}px,${y}px,0)`;
+  };
+
+  window.addEventListener('mousemove', e => {
+    x = e.clientX; y = e.clientY;
+    if (!queued) { queued = true; raf(draw); }
+  }, { passive: true });
+
+  const install = () => {
+    dot = document.createElement('div');
+    dot.style.cssText = 'position:fixed;left:0;top:0;width:16px;height:16px;' +
+      'margin:-8px 0 0 -8px;border:2px solid red;border-radius:50%;' +
+      'box-sizing:border-box;pointer-events:none;z-index:2147483647;' +
+      'will-change:transform;contain:strict;';
+    document.documentElement.appendChild(dot);
+  };
+  if (document.documentElement) install();
+  else document.addEventListener('DOMContentLoaded', install, { once: true });
+})();
+"""
+
 # ─── Frame decode ──────────────────────────────────────────────────────────────
-
-import base64
-
 def b64_to_cv2(data_url: str) -> np.ndarray:
     _, b64 = data_url.split(",", 1)
     raw = base64.b64decode(b64)
@@ -104,134 +131,146 @@ def b64_to_cv2(data_url: str) -> np.ndarray:
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-# ─── Vision ────────────────────────────────────────────────────────────────────
-
-def find_blobs(mask: np.ndarray, min_area: int):
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    blobs = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        M = cv2.moments(cnt)
-        if area > min_area:
-            if M["m00"] > 0:
-                blobs.append((int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]), area))
-    return blobs
-
-
-def detect_game_objects(frame: np.ndarray,tick: int):
-    h, w = frame.shape[:2]
-    cx, cy = w / 2, h / 2
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-
-    #enemy_mask = cv2.inRange(hsv, ENEMY_LOWER, ENEMY_UPPER)
-    bg_mask    = cv2.inRange(hsv, BG_LOWER, BG_UPPER)
-    bg_mask = cv2.bitwise_not(bg_mask)
-    bg_mask[50:135,550:725] = 0
-    bg_mask[:275,968:] = 0
-    bg_mask = cv2.erode(bg_mask, np.ones((3,3), np.uint8), iterations=5)
-
-    #enemy_mask = cv2.bitwise_and(enemy_mask, cv2.bitwise_not(bg_mask))
-    #enemy_mask = cv2.dilate(enemy_mask, np.ones((7, 7), np.uint8), iterations=2)
-
-    min_area = 40
-    blobs = find_blobs(bg_mask, min_area)
-    
-    if args.debug:
-        bg_mask = cv2.cvtColor(bg_mask,cv2.COLOR_GRAY2BGR)
-        for blob in blobs:
-            bg_mask = cv2.circle(bg_mask, (blob[0],blob[1]), 10, (0,0,255))
-        cv2.imwrite(f"{OUTPUT}/frame{tick}.jpg", np.vstack((frame,bg_mask)))
-        blobs.sort(key=lambda x: x[1])
-        with open("out/blobs.txt", "a") as f:
-            f.write(f"tick {tick:<3} |  ")
-            for i,blob in enumerate(blobs):
-                f.write(f"{i}:{blob[2]}  ")
-            f.write("\n")
-
-    blobs.sort(key=lambda x: x[2])
-    area_cutoff = 1000
-    index_cutoff = len(blobs)
-    for i,blob in enumerate(blobs):
-        if blob[1] > area_cutoff:
-            index_cutoff = i - 1
-
-    food = [(b[0],b[1]) for b in blobs[:index_cutoff]]
-    enemies = blobs[index_cutoff:]
-            
-    return enemies, food
-
-
-# ─── Bot brain ─────────────────────────────────────────────────────────────────
-
-class AggressiveBot:
+# ─── BOTS ─────────────────────────────────────────────────────────────────
+class AggressiveBot:  # OUTDATED, needs refactoring for GameObject type
     def __init__(self):
         self.boost_active = False
-        self.drift_angle  = 0.0
+        self.drift_angle = 0.0
+        self.head_x = 1265 / 2
+        self.head_y = 565 / 2
+        self.circle_input = (
+            self.head_x + math.cos(self.drift_angle) * 15,
+            self.head_y + math.sin(self.drift_angle) * 15,
+            False,
+        )
 
-    def decide(self, frame: np.ndarray,tick: int):
-        h, w = frame.shape[:2]
-        cx, cy = w / 2, h / 2
-        enemies, food = detect_game_objects(frame,tick)
-        head_x = cx
-        head_y = cy
+    def decide(self, frame: np.ndarray, tick: int):
+        enemies, food = detect_game_objects(frame, args.debug)
 
         best_enemy, best_dist = None, float("inf")
         for ex, ey, area in enemies:
-            d = math.hypot(ex - head_x, ey - head_y)
+            d = math.hypot(ex - self.head_x, ey - self.head_y)
             if d < best_dist and d < CHASE_RADIUS:
                 best_dist, best_enemy = d, (ex, ey)
 
         if best_enemy:
             tx, ty = best_enemy
-            angle = math.atan2(ty - head_y, tx - head_x)
+            angle = math.atan2(ty - self.head_y, tx - self.head_x)
             self.drift_angle = angle
-            return (tx + math.cos(angle) * 40,
-                    ty + math.sin(angle) * 40,
-                    BOOST_MIN_DIST < best_dist < BOOST_MAX_DIST)
+            return (
+                tx + math.cos(angle) * 40,
+                ty + math.sin(angle) * 40,
+                BOOST_MIN_DIST < best_dist < BOOST_MAX_DIST,
+            )
 
         if food:
-            fx, fy = min(food, key=lambda p: math.hypot(p[0] - head_x, p[1] - head_y))
-            self.drift_angle = math.atan2(fy - head_y, fx - head_x)
+            fx, fy = min(
+                food, key=lambda p: math.hypot(p[0] - self.head_x, p[1] - self.head_y)
+            )
+            self.drift_angle = math.atan2(fy - self.head_y, fx - self.head_x)
             return fx, fy, False
 
         self.drift_angle += 0.3
-        return (head_x + math.cos(self.drift_angle) * 15,
-                head_y + math.sin(self.drift_angle) * 15,
-                False)
+
 
 class PassiveBot:
-    def __init__(self):
+    def __init__(self, frame_width, frame_height):
         self.boost_active = False
-        self.drift_angle  = 0.0
+        self.drift_angle = 0.0
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.center_x = frame_width / 2
+        self.center_y = frame_height / 2
+        self.heading = (0, 0)
 
-    def decide(self, frame: np.ndarray,tick: int):
-        h, w = frame.shape[:2]
-        cx, cy = w / 2, h / 2
-        enemies, food = detect_game_objects(frame,tick)
-        head_x = cx
-        head_y = cy
+    def circle(self):
+        self.drift_angle += 1
+        return (
+            (self.center_x + 15, self.center_y, False)
+            if self.drift_angle % 2 == 0
+            else (self.center_x - 15, self.center_y, False)
+        )
+
+    def decide(self, frame: np.ndarray, tick: int):
+        enemies, foods, us, debug_frame = detect_game_objects(frame, tick)
+
+        if not foods:
+            return self.circle()
+        else:
+            for f in foods:
+                f.dist_moment_to_center = math.hypot(f.moment[0] - self.center_x, f.moment[1] - self.center_y)
+            foods.sort(key=lambda f: f.dist_moment_to_center)
+
+            nearest_food_index = 0
+
+            while nearest_food_index != len(foods):
+                nearest_food = foods[nearest_food_index]
+                f_x, f_y = nearest_food.moment
+                f_x = (f_x - self.center_x) * 1.3 + f_x
+                f_y = (f_y - self.center_y) * 1.3 + f_y
+                if enemies:
+                    for enemy in enemies:
+                        if line_intersects_contour(
+                            (self.frame_width,self.frame_height),
+                            enemy.contour,
+                            (round(self.center_x), round(self.center_y)),
+                            (round(f_x),round(f_y))
+                        ):
+                            nearest_food_index += 1
+                            if args.debug:
+                                debug_frame = cv2.line(
+                                    debug_frame,
+                                    (round(self.center_x), round(self.center_y * 3)),
+                                    (
+                                        round(f_x),
+                                        round(f_y + self.center_y * 2),
+                                    ),
+                                    (0, 0, 255),
+                                )
+                            break
+                        self.heading_x = f_x
+                        self.heading_y = f_y
+                        if args.debug:
+                            debug_frame = cv2.line(
+                                debug_frame,
+                                (round(self.center_x), round(self.center_y * 3)),
+                                (round(f_x), round(f_y + self.center_y * 2)),
+                                (255, 0, 0),
+                            )
+                            cv2.imwrite(f"{OUTPUT_DIR}/frame{tick}.jpg", debug_frame)
+                        return (f_x, f_y, False)
+                else: 
+                    self.heading_x = f_x
+                    self.heading_y = f_y
+                    if args.debug:
+                        debug_frame = cv2.line(
+                            debug_frame,
+                            (round(self.center_x), round(self.center_y * 3)),
+                            (round(f_x), round(f_y + self.center_y * 2)),
+                            (255, 0, 0),
+                        )
+                        cv2.imwrite(f"{OUTPUT_DIR}/frame{tick}.jpg", debug_frame)
+                    return (f_x, f_y, False)
 
 
- 
+            if args.debug:
+                cv2.imwrite(f"{OUTPUT_DIR}/frame{tick}.jpg", debug_frame)
+            return self.circle()
 
 
 # ─── Main loop ─────────────────────────────────────────────────────────────────
-
 async def run_bot():
-    bot = AggressiveBot()
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, args=["--window-size=1280,720", "--mute-audio"])
+        browser = await p.chromium.launch(
+            headless=False, args=["--window-size=1280,720", "--mute-audio"]
+        )
         context = await browser.new_context(viewport={"width": 1280, "height": 720})
+        await context.add_init_script(CURSOR_JS)
         page = await context.new_page()
 
         print("[BOT] Opening Snake.io ...")
         await page.goto(GAME_URL, wait_until="domcontentloaded")
         await asyncio.sleep(6)
-
 
         # Install the rAF hook
         result = await page.evaluate(HOOK_JS)
@@ -250,8 +289,8 @@ async def run_bot():
             }
         """)
         cl, ct, cw, ch = cb["left"], cb["top"], cb["w"], cb["h"]
+        bot = PassiveBot(frame_width=cw, frame_height=ch-BOTTOM_CROP)
         print(f"[BOT] Canvas: {cw}x{ch} at page ({cl},{ct})")
-        print("[BOT] Running — Ctrl+C to stop\n")
 
         game_loaded = False
         with open("tesseract_output", "w") as f:
@@ -260,14 +299,20 @@ async def run_bot():
             start = time.time()
             result = await page.evaluate(READ_JS)
             if result:
-                frame = b64_to_cv2(result) 
-                image = Image.frombytes("RGB",(frame.shape[1],frame.shape[0]),frame)
+                frame = b64_to_cv2(result)
+                image = Image.frombytes("RGB", (frame.shape[1], frame.shape[0]), frame)
                 text = pytesseract.image_to_string(image).lower()
-                if "download" not in text and ("player" in text or "input" in text or "lag" in text or "ping" in text):
-                    game_loaded=True
+                if "download" not in text and (
+                    "player" in text
+                    or "input" in text
+                    or "lag" in text
+                    or "ping" in text
+                ):
+                    game_loaded = True
                     print("Game loaded, starting bot")
             end = time.time()
-            print(f"[DEBUG] tesseract loop took {end-start:.3f} secs")
+            if args.time:
+                print(f"[DEBUG] tesseract loop took {end-start:.3f} secs")
             await asyncio.sleep(0.5)
 
         tick = 0
@@ -283,19 +328,22 @@ async def run_bot():
                     continue
 
                 frame = b64_to_cv2(result)
-                frame = frame[:-40,:,:]
+                frame = frame[:-BOTTOM_CROP, :, :] # remove text from bottom
                 end2 = time.time()
-                print(f"[DEBUG] js eval  took {end2-start:.3f} secs")
+                if args.time:
+                    print(f"[DEBUG] js eval  took {end2-start:.3f} secs")
 
                 start2 = time.time()
-                tx, ty, boost = bot.decide(frame,tick)
+                tx, ty, boost = bot.decide(frame, tick)
                 end2 = time.time()
-                print(f"[DEBUG] decision took {end2-start2:.3f} secs")
+                if args.time:
+                    print(f"[DEBUG] decision took {end2-start2:.3f} secs")
 
                 start2 = time.time()
-                #await page.mouse.move(cl + tx, ct + ty)
+                await page.mouse.move(cl + tx, ct + ty)
                 end2 = time.time()
-                print(f"[DEBUG] input    took {end2-start2:.3f} secs")
+                if args.time:
+                    print(f"[DEBUG] input    took {end2-start2:.3f} secs")
 
                 if boost and not bot.boost_active:
                     await page.mouse.down()
@@ -305,15 +353,14 @@ async def run_bot():
                     bot.boost_active = False
 
                 end2 = time.time()
-                print(f"[DEBUG] tick {tick} took {end2-start:.3f} secs")
+                if args.time:
+                    print(f"[DEBUG] tick {tick} took {end2-start:.3f} secs")
                 tick += 1
 
             except KeyboardInterrupt:
+                print(f"[INFO] avg tick time: {sum(times)/len(times)}")
                 print("\n[BOT] Stopped.")
                 break
-
-        await page.mouse.up()
-        await browser.close()
 
 
 if __name__ == "__main__":
