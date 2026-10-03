@@ -209,9 +209,10 @@ class PassiveBot:
                 f_x = (f_x - self.center_x) * 1.3 + f_x
                 f_y = (f_y - self.center_y) * 1.3 + f_y
                 if enemies:
+                    blocked = False
                     for enemy in enemies:
                         if line_intersects_contour(
-                            (self.frame_width,self.frame_height),
+                            frame.shape,
                             enemy.contour,
                             (round(self.center_x), round(self.center_y)),
                             (round(f_x),round(f_y))
@@ -227,7 +228,9 @@ class PassiveBot:
                                     ),
                                     (0, 0, 255),
                                 )
+                            blocked = True
                             break
+                    if not blocked:
                         self.heading_x = f_x
                         self.heading_y = f_y
                         if args.debug:

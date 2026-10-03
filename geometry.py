@@ -23,7 +23,7 @@ def find_objects(
 ) -> Tuple[List[GameObject], GameObject]:
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs = []
     us = None
     for cnt in contours:
@@ -118,7 +118,7 @@ def line_intersects_contour(img_shape, contour, p1, p2):
     c_mask = np.zeros((h, w), np.uint8)
     l_mask = np.zeros((h, w), np.uint8)
 
-    cv2.drawContours(c_mask, [contour], -1, 255, thickness=1)  # use -1 to treat the contour as a filled region
+    cv2.drawContours(c_mask, [contour], -1, 255, thickness=2)  # use -1 to treat the contour as a filled region
     cv2.line(l_mask, p1, p2, 255, thickness=4)  # thickness=2 avoids diagonal "slip-through" misses
 
     return cv2.countNonZero(cv2.bitwise_and(c_mask, l_mask)) > 0
