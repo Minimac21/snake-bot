@@ -29,3 +29,8 @@ start.sh
 view.sh
 
 - uses sxiv to view the debug info in order
+
+
+## Status
+
+I'm currently abandoning this project because it proved too difficult. I'm going to work on a slither.io bot, because it exposes state information.
